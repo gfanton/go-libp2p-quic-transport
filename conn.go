@@ -2,6 +2,7 @@ package libp2pquic
 
 import (
 	"context"
+	"net"
 
 	ic "github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/mux"
@@ -11,6 +12,14 @@ import (
 	quic "github.com/lucas-clemente/quic-go"
 	ma "github.com/multiformats/go-multiaddr"
 )
+
+type pConn interface {
+	net.PacketConn
+
+	// count conn reference
+	DecreaseCount()
+	IncreaseCount()
+}
 
 type conn struct {
 	sess      quic.Session

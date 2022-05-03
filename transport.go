@@ -51,18 +51,30 @@ var quicConfig = &quic.Config{
 const statelessResetKeyInfo = "libp2p quic stateless reset key"
 const errorCodeConnectionGating = 0x47415445 // GATE in ASCII
 
-type connManager struct {
-	reuseUDP4 *reuse
-	reuseUDP6 *reuse
+type noreuseConn struct {
+	*net.UDPConn
 }
 
-func newConnManager() (*connManager, error) {
+func (c *noreuseConn) IncreaseCount() {}
+func (c *noreuseConn) DecreaseCount() {}
+
+func newNoReuseConn(conn *net.UDPConn) *noreuseConn {
+	return &noreuseConn{UDPConn: conn}
+}
+
+type connManager struct {
+	reuseUDP4       *reuse
+	reuseUDP6       *reuse
+	reuseportEnable bool
+}
+
+func newConnManager(reuseport bool) (*connManager, error) {
 	reuseUDP4 := newReuse()
 	reuseUDP6 := newReuse()
-
 	return &connManager{
-		reuseUDP4: reuseUDP4,
-		reuseUDP6: reuseUDP6,
+		reuseUDP4:       reuseUDP4,
+		reuseUDP6:       reuseUDP6,
+		reuseportEnable: reuseport,
 	}, nil
 }
 
@@ -77,20 +89,43 @@ func (c *connManager) getReuse(network string) (*reuse, error) {
 	}
 }
 
-func (c *connManager) Listen(network string, laddr *net.UDPAddr) (*reuseConn, error) {
-	reuse, err := c.getReuse(network)
+func (c *connManager) Listen(network string, laddr *net.UDPAddr) (pConn, error) {
+	if c.reuseportEnable {
+		reuse, err := c.getReuse(network)
+		if err != nil {
+			return nil, err
+		}
+		return reuse.Listen(network, laddr)
+	}
+
+	conn, err := net.ListenUDP(network, laddr)
 	if err != nil {
 		return nil, err
 	}
-	return reuse.Listen(network, laddr)
+	return newNoReuseConn(conn), nil
 }
 
-func (c *connManager) Dial(network string, raddr *net.UDPAddr) (*reuseConn, error) {
-	reuse, err := c.getReuse(network)
+func (c *connManager) Dial(network string, raddr *net.UDPAddr) (pConn, error) {
+	if c.reuseportEnable {
+		reuse, err := c.getReuse(network)
+		if err != nil {
+			return nil, err
+		}
+		return reuse.Dial(network, raddr)
+	}
+
+	var laddr *net.UDPAddr
+	switch network {
+	case "udp4":
+		laddr = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	case "udp6":
+		laddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
+	}
+	conn, err := net.ListenUDP(network, laddr)
 	if err != nil {
 		return nil, err
 	}
-	return reuse.Dial(network, raddr)
+	return newNoReuseConn(conn), nil
 }
 
 func (c *connManager) Close() error {
@@ -127,7 +162,12 @@ type activeHolePunch struct {
 }
 
 // NewTransport creates a new QUIC transport
-func NewTransport(key ic.PrivKey, psk pnet.PSK, gater connmgr.ConnectionGater) (tpt.Transport, error) {
+func NewTransport(key ic.PrivKey, psk pnet.PSK, gater connmgr.ConnectionGater, opts ...Option) (tpt.Transport, error) {
+	var cfg Config
+	if err := cfg.apply(opts...); err != nil {
+		return nil, fmt.Errorf("unable to apply quic-tpt option(s): %w", err)
+	}
+
 	if len(psk) > 0 {
 		log.Error("QUIC doesn't support private networks yet.")
 		return nil, errors.New("QUIC doesn't support private networks yet")
@@ -140,29 +180,30 @@ func NewTransport(key ic.PrivKey, psk pnet.PSK, gater connmgr.ConnectionGater) (
 	if err != nil {
 		return nil, err
 	}
-	connManager, err := newConnManager()
+	connManager, err := newConnManager(!cfg.disableReuseport)
 	if err != nil {
 		return nil, err
 	}
-	config := quicConfig.Clone()
+
+	qconfig := quicConfig.Clone()
 	keyBytes, err := key.Raw()
 	if err != nil {
 		return nil, err
 	}
 	keyReader := hkdf.New(sha256.New, keyBytes, nil, []byte(statelessResetKeyInfo))
-	config.StatelessResetKey = make([]byte, 32)
-	if _, err := io.ReadFull(keyReader, config.StatelessResetKey); err != nil {
+	qconfig.StatelessResetKey = make([]byte, 32)
+	if _, err := io.ReadFull(keyReader, qconfig.StatelessResetKey); err != nil {
 		return nil, err
 	}
-	config.Tracer = tracer
+	qconfig.Tracer = tracer
 
 	return &transport{
 		privKey:      key,
 		localPeer:    localPeer,
 		identity:     identity,
 		connManager:  connManager,
-		serverConfig: config,
-		clientConfig: config.Clone(),
+		serverConfig: qconfig,
+		clientConfig: qconfig.Clone(),
 		gater:        gater,
 		holePunching: make(map[holePunchKey]*activeHolePunch),
 	}, nil
@@ -269,7 +310,7 @@ loop:
 			punchErr = err
 			break
 		}
-		if _, err := pconn.UDPConn.WriteToUDP(payload, addr); err != nil {
+		if _, err := pconn.WriteTo(payload, addr); err != nil {
 			punchErr = err
 			break
 		}
